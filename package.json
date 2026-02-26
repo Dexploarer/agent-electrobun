@@ -1,0 +1,22 @@
+{
+  "name": "agent-electrobun",
+  "version": "0.1.0",
+  "description": "CDP automation CLI for Electrobun desktop apps. Like agent-browser, but for OOPIF-based Electrobun apps.",
+  "type": "module",
+  "bin": {
+    "agent-electrobun": "src/agent-electrobun.ts"
+  },
+  "scripts": {
+    "start": "bun src/agent-electrobun.ts",
+    "ctl": "bun src/agent-electrobun.ts"
+  },
+  "keywords": ["electrobun", "cdp", "automation", "testing", "browser", "ai-agent", "accessibility"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ataraxy-labs/agent-electrobun"
+  },
+  "engines": {
+    "bun": ">=1.0.0"
+  }
+}
