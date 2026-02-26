@@ -1,7 +1,7 @@
 ---
 name: agent-electrobun
 description: "CDP controller for Electrobun apps with multi-tab OOPIF architecture. Use when asked to interact with, test, screenshot, click, fill, or automate an Electrobun desktop app. Triggers on: interact with app, click button, test UI, screenshot app, inspect element, automate Electrobun, take screenshot, fill form, test this app, dogfood, QA the app."
-allowed-tools: Bash(agent-electrobun:*), Bash(bun run ctl:*), Bash(bun src/agent-electrobun.ts:*)
+allowed-tools: Bash(agent-electrobun:*), Bash(bun run ctl:*), Bash(bun scripts/agent-electrobun.ts:*)
 ---
 
 # Electrobun App Automation with agent-electrobun
@@ -72,6 +72,11 @@ agent-electrobun tabs                            # List tabs with active indicat
 # Snapshot
 agent-electrobun snapshot -i                     # Interactive elements with @refs (recommended)
 agent-electrobun snapshot                        # Full accessibility tree
+agent-electrobun snapshot -i -C                  # Include cursor-interactive elements (onclick, cursor:pointer)
+agent-electrobun snapshot -c                     # Compact output (flat list, no hierarchy)
+agent-electrobun snapshot -d 3                   # Limit depth to 3 levels
+agent-electrobun snapshot -s "#main"             # Scope to CSS selector
+agent-electrobun snapshot @e1                    # Scope to ref's subtree
 
 # Interaction (use @refs from snapshot)
 agent-electrobun click @e1                       # Click element
@@ -88,6 +93,7 @@ agent-electrobun select @e1 "value"             # Select dropdown option by valu
 agent-electrobun scroll down 500                 # Scroll page (default: 400px)
 agent-electrobun scroll up                       # Scroll up
 agent-electrobun scrollintoview @e1              # Scroll element into view
+agent-electrobun drag @e1 @e2                    # Drag element to another element
 
 # Mouse (low-level)
 agent-electrobun mouse move 100 200              # Move mouse to coordinates
@@ -98,6 +104,8 @@ agent-electrobun mouse wheel 100                 # Mouse wheel scroll (deltaY)
 # Keyboard (low-level)
 agent-electrobun keyboard type "text"            # Type with key events (char by char)
 agent-electrobun keyboard inserttext "text"      # Insert text without key events
+agent-electrobun keydown Shift                   # Hold key down
+agent-electrobun keyup Shift                     # Release key
 
 # Get information
 agent-electrobun get text @e1                    # Element text content
@@ -120,9 +128,11 @@ agent-electrobun wait 2000                       # Wait milliseconds
 agent-electrobun wait "#my-element"              # Wait for CSS selector (10s timeout)
 agent-electrobun wait --text "Sign in"           # Wait for text on page
 agent-electrobun wait --fn "window.loaded"       # Wait for JS condition to be truthy
+agent-electrobun wait --url "**/dashboard"       # Wait for URL pattern (glob or substring)
+agent-electrobun wait @e1                        # Wait for ref to be resolvable
 
 # Capture
-agent-electrobun screenshot                      # Screenshot (default: /tmp/electrobun-screenshot.png)
+agent-electrobun screenshot                      # Screenshot (default: /tmp/quiver-tab.png)
 agent-electrobun screenshot /tmp/my.png          # Save to specific path
 agent-electrobun screenshot --annotate           # With numbered ref labels overlaid
 agent-electrobun screenshot --full               # Full page (beyond viewport)
@@ -133,13 +143,37 @@ agent-electrobun diff snapshot                   # Compare current vs last snaps
 # Debug
 agent-electrobun highlight @e1                   # Highlight element with red border (fades in 5s)
 
+# Console / Errors
+agent-electrobun console                         # View captured console messages
+agent-electrobun console --clear                 # Clear console buffer
+agent-electrobun errors                          # View captured errors
+agent-electrobun errors --clear                  # Clear error buffer
+
+# Dialogs
+agent-electrobun dialog accept                   # Accept JS dialog (alert/confirm/prompt)
+agent-electrobun dialog accept "yes"             # Accept prompt dialog with text
+agent-electrobun dialog dismiss                  # Dismiss JS dialog
+
+# Semantic locators (alternative to refs)
+agent-electrobun find text "Sign In" click       # Find by text and click
+agent-electrobun find label "Email" fill "user@test.com"  # Find by label and fill
+agent-electrobun find role button click           # Find by ARIA role
+agent-electrobun find placeholder "Search" fill "query"   # Find by placeholder
+agent-electrobun find testid "submit-btn" click   # Find by data-testid
+agent-electrobun find alt "Logo" click            # Find by alt text
+agent-electrobun find title "Close" click         # Find by title attribute
+
 # JavaScript
 agent-electrobun eval 'document.title'           # Evaluate JS in target
+agent-electrobun eval -b "<base64>"              # Evaluate base64-encoded JS
+agent-electrobun eval --stdin                    # Read JS from stdin
 agent-electrobun shell eval 'document.title'     # Evaluate JS in shell
 
 # Tab management
 agent-electrobun new-tab                         # Create a new tab
 agent-electrobun open-repo /path/to/repo         # Open repo in active tab
+agent-electrobun tab switch tab-2                # Switch to a specific tab
+agent-electrobun tab close tab-2                 # Close a specific tab
 agent-electrobun open-repo /path/to/repo tab-2   # Open repo in specific tab
 ```
 
@@ -302,6 +336,41 @@ agent-electrobun mouse down left           # Press left button
 agent-electrobun mouse move 300 200        # Drag to new position
 agent-electrobun mouse up left             # Release (completes drag)
 agent-electrobun mouse wheel -200          # Scroll up via wheel
+```
+
+### Drag and Drop
+
+```bash
+agent-electrobun snapshot -i
+agent-electrobun drag @e3 @e7                    # Drag file from one location to another
+agent-electrobun wait 1000
+agent-electrobun snapshot -i                     # Verify new state
+```
+
+### Semantic Locators (No Snapshot Needed)
+
+```bash
+agent-electrobun find text "Sign In" click
+agent-electrobun find placeholder "Email" fill "user@example.com"
+agent-electrobun find placeholder "Password" fill "secret"
+agent-electrobun find testid "submit" click
+agent-electrobun wait --text "Welcome"
+```
+
+### Dialog Handling
+
+```bash
+agent-electrobun click @e5                        # Triggers a confirm dialog
+agent-electrobun dialog accept                    # Accept it
+agent-electrobun snapshot -i                      # Verify result
+```
+
+### Console Debugging
+
+```bash
+agent-electrobun console                          # Check for logged messages
+agent-electrobun errors                           # Check for JS errors
+agent-electrobun console --clear                  # Clear after reviewing
 ```
 
 ## Timeouts and Slow UI

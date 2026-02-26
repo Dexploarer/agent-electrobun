@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * agent-electrobun — CDP automation CLI for Electrobun desktop apps.
+ * quiver-ctl — Full-featured CDP controller for the Quiver Electrobun app.
  *
  * Attaches to EXISTING CDP targets (shell / tab OOPIFs) via WebSocket.
  * Never creates new pages or navigates away — preserves the OOPIF lifecycle.
@@ -11,10 +11,10 @@
  *   (default)            Target the active tab
  */
 
-const CDP_PORT = process.env.ELECTROBUN_CDP_PORT ?? process.env.QUIVER_CDP_PORT ?? "9222";
+const CDP_PORT = process.env.QUIVER_CDP_PORT ?? "9222";
 const CDP_BASE = `http://localhost:${CDP_PORT}`;
-const REFS_PATH = "/tmp/agent-electrobun-refs.json";
-const SNAPSHOT_PATH = "/tmp/agent-electrobun-last-snapshot.json";
+const REFS_PATH = "/tmp/quiver-ctl-refs.json";
+const SNAPSHOT_PATH = "/tmp/quiver-ctl-last-snapshot.json";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -77,6 +77,14 @@ const KEY_MAP: Record<string, KeyDef> = {
   f7: { key: "F7", code: "F7", keyCode: 118 }, f8: { key: "F8", code: "F8", keyCode: 119 },
   f9: { key: "F9", code: "F9", keyCode: 120 }, f10: { key: "F10", code: "F10", keyCode: 121 },
   f11: { key: "F11", code: "F11", keyCode: 122 }, f12: { key: "F12", code: "F12", keyCode: 123 },
+  // Modifier keys (for keydown/keyup commands)
+  shift:    { key: "Shift", code: "ShiftLeft", keyCode: 16 },
+  control:  { key: "Control", code: "ControlLeft", keyCode: 17 },
+  ctrl:     { key: "Control", code: "ControlLeft", keyCode: 17 },
+  alt:      { key: "Alt", code: "AltLeft", keyCode: 18 },
+  meta:     { key: "Meta", code: "MetaLeft", keyCode: 91 },
+  command:  { key: "Meta", code: "MetaLeft", keyCode: 91 },
+  cmd:      { key: "Meta", code: "MetaLeft", keyCode: 91 },
 };
 
 // CDP modifier bit flags
@@ -95,6 +103,11 @@ function parseKeyCombo(combo: string): { keyDef: KeyDef; modifiers: number } {
     const lower = p.toLowerCase();
     if (MOD_MAP[lower] != null) { modifiers |= MOD_MAP[lower]; }
     else { keyPart = p; }
+  }
+  // If no key part but modifiers exist, the combo is a bare modifier key (e.g., "Shift")
+  if (!keyPart && modifiers) {
+    const firstMod = parts[parts.length - 1].toLowerCase();
+    if (KEY_MAP[firstMod]) return { keyDef: KEY_MAP[firstMod], modifiers: 0 };
   }
   const lower = keyPart.toLowerCase();
   if (KEY_MAP[lower]) return { keyDef: KEY_MAP[lower], modifiers };
@@ -124,6 +137,7 @@ class CDPClient {
   private ws: WebSocket;
   private nextId = 1;
   private pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
+  private listeners = new Map<string, Set<(params: any) => void>>();
   private ready: Promise<void>;
 
   private constructor(wsUrl: string) {
@@ -142,6 +156,9 @@ class CDPClient {
           if (msg.error) p.reject(new Error(msg.error.message ?? JSON.stringify(msg.error)));
           else p.resolve(msg.result);
         }
+      } else if (msg.method) {
+        const fns = this.listeners.get(msg.method);
+        if (fns) for (const fn of fns) fn(msg.params);
       }
     };
   }
@@ -154,6 +171,23 @@ class CDPClient {
     }
     try { await client.call("DOM.getDocument", { depth: -1 }, 5000); } catch { /* ignore */ }
     return client;
+  }
+
+  on(method: string, fn: (params: any) => void): void {
+    if (!this.listeners.has(method)) this.listeners.set(method, new Set());
+    this.listeners.get(method)!.add(fn);
+  }
+
+  off(method: string, fn: (params: any) => void): void {
+    this.listeners.get(method)?.delete(fn);
+  }
+
+  once(method: string, timeoutMs = 15_000): Promise<any> {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { this.off(method, handler); reject(new Error(`Timed out waiting for ${method} (${timeoutMs}ms)`)); }, timeoutMs);
+      const handler = (params: any) => { clearTimeout(timer); this.off(method, handler); resolve(params); };
+      this.on(method, handler);
+    });
   }
 
   async call<T = any>(method: string, params: Record<string, any> = {}, timeoutMs = 15_000): Promise<T> {
@@ -236,6 +270,20 @@ async function getFullAXTree(client: CDPClient): Promise<AXNode[]> {
   return r.nodes ?? [];
 }
 
+async function getScopedAXTree(client: CDPClient, backendNodeId: number): Promise<AXNode[]> {
+  const nodeId = await resolveBackendNode(client, backendNodeId);
+  const r = await client.call("Accessibility.getPartialAXTree", { nodeId, fetchRelatives: false }, 10_000);
+  return r.nodes ?? [];
+}
+
+async function resolveSelector(client: CDPClient, selector: string): Promise<number> {
+  const doc = await client.call("DOM.getDocument", { depth: 0 });
+  const r = await client.call("DOM.querySelector", { nodeId: doc.root.nodeId, selector });
+  if (!r.nodeId) throw new Error(`Selector "${selector}" not found`);
+  const desc = await client.call("DOM.describeNode", { nodeId: r.nodeId });
+  return desc.node.backendNodeId;
+}
+
 async function resolveBackendNode(client: CDPClient, backendDOMNodeId: number): Promise<number> {
   const r = await client.call("DOM.describeNode", { backendNodeId: backendDOMNodeId });
   return r.node?.nodeId;
@@ -308,6 +356,138 @@ async function callOnNode(client: CDPClient, nodeId: number, fn: string): Promis
   return r.result?.value;
 }
 
+async function findElement(client: CDPClient, strategy: string, value: string): Promise<{ objectId: string; backendNodeId: number; nodeId: number }> {
+  let expression: string;
+  const escaped = value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  switch (strategy) {
+    case "testid":
+      expression = `document.querySelector('[data-testid="${escaped}"], [data-test-id="${escaped}"]')`;
+      break;
+    case "placeholder":
+      expression = `Array.from(document.querySelectorAll('input,textarea')).find(el => (el.placeholder||'').includes('${escaped}'))`;
+      break;
+    case "label": {
+      expression = `(() => {
+        const labels = Array.from(document.querySelectorAll('label'));
+        const label = labels.find(l => l.textContent?.includes('${escaped}'));
+        if (!label) return null;
+        if (label.htmlFor) return document.getElementById(label.htmlFor);
+        return label.querySelector('input,textarea,select,button') || label;
+      })()`;
+      break;
+    }
+    case "text":
+      expression = `(() => {
+        const priority = 'button,a,[role="button"],[role="link"],[role="menuitem"],input[type="submit"],input[type="button"]';
+        for (const el of document.querySelectorAll(priority)) {
+          if ((el.textContent||'').trim().includes('${escaped}')) return el;
+        }
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
+        let node;
+        while (node = walker.nextNode()) {
+          if ((node.textContent||'').trim().includes('${escaped}') && node.children.length === 0) return node;
+        }
+        return null;
+      })()`;
+      break;
+    case "role":
+      expression = `document.querySelector('[role="${escaped}"]') || document.querySelector('${escaped}')`;
+      break;
+    case "alt":
+      expression = `document.querySelector('[alt="${escaped}"]')`;
+      break;
+    case "title":
+      expression = `document.querySelector('[title="${escaped}"]')`;
+      break;
+    default:
+      throw new Error(`Unknown find strategy: ${strategy}. Use: text, label, role, placeholder, alt, title, testid`);
+  }
+
+  const r = await client.call("Runtime.evaluate", { expression, returnByValue: false, awaitPromise: false });
+  if (!r.result?.objectId) throw new Error(`No element found with ${strategy}="${value}"`);
+  const desc = await client.call("DOM.describeNode", { objectId: r.result.objectId });
+  if (!desc.node?.backendNodeId) throw new Error(`Could not resolve element found by ${strategy}="${value}"`);
+  const nodeId = await resolveBackendNode(client, desc.node.backendNodeId);
+  return { objectId: r.result.objectId, backendNodeId: desc.node.backendNodeId, nodeId };
+}
+
+async function collectCursorInteractiveIds(client: CDPClient): Promise<Array<{ backendNodeId: number; tag: string; text: string }>> {
+  // Collect elements in a single batch using Runtime.evaluate returning remote objects
+  const countResult = await evalJS(client, `(() => {
+    const seen = new Set();
+    const result = [];
+    document.querySelectorAll('[onclick], [role="button"], [tabindex]:not([tabindex="-1"]), a[href], button, summary, label').forEach(el => {
+      if (!seen.has(el)) { seen.add(el); result.push(el); }
+    });
+    const divs = document.querySelectorAll('div, span, li, img, svg, td, tr');
+    let c = 0;
+    for (const el of divs) {
+      if (c >= 300) break;
+      if (window.getComputedStyle(el).cursor === 'pointer' && !seen.has(el)) { seen.add(el); result.push(el); }
+      c++;
+    }
+    window.__quiverCtlCursorEls = result;
+    return result.length;
+  })()`);
+
+  const count = typeof countResult === "number" ? countResult : 0;
+  const results: Array<{ backendNodeId: number; tag: string; text: string }> = [];
+
+  for (let i = 0; i < count; i++) {
+    try {
+      const objResult = await client.call("Runtime.evaluate", {
+        expression: `window.__quiverCtlCursorEls[${i}]`,
+        returnByValue: false,
+      });
+      if (!objResult.result?.objectId) continue;
+      const desc = await client.call("DOM.describeNode", { objectId: objResult.result.objectId });
+      const tagResult = await client.call("Runtime.callFunctionOn", {
+        objectId: objResult.result.objectId,
+        functionDeclaration: "function() { return JSON.stringify({ tag: this.tagName?.toLowerCase() || '', text: (this.textContent || '').trim().slice(0, 80) }); }",
+        returnByValue: true,
+      });
+      const info = JSON.parse(tagResult.result?.value || '{"tag":"","text":""}');
+      if (desc.node?.backendNodeId) {
+        results.push({ backendNodeId: desc.node.backendNodeId, tag: info.tag, text: info.text });
+      }
+    } catch { /* skip */ }
+  }
+
+  // Cleanup
+  await evalJS(client, "delete window.__quiverCtlCursorEls").catch(() => {});
+  return results;
+}
+
+// ── Console/error log hooks ───────────────────────────────────────────────────
+
+async function ensureLogHooks(client: CDPClient): Promise<void> {
+  const alreadyInstalled = await evalJS(client, "!!window.__quiverCtlLogs");
+  if (alreadyInstalled) return;
+  await evalJS(client, `(() => {
+    window.__quiverCtlLogs = { console: [], errors: [] };
+    const MAX = 500;
+    const origLog = console.log, origWarn = console.warn, origError = console.error, origInfo = console.info, origDebug = console.debug;
+    function capture(level, args) {
+      const entry = { level, ts: Date.now(), args: args.map(a => { try { return typeof a === 'object' ? JSON.stringify(a) : String(a); } catch { return String(a); } }) };
+      window.__quiverCtlLogs.console.push(entry);
+      if (window.__quiverCtlLogs.console.length > MAX) window.__quiverCtlLogs.console.shift();
+    }
+    console.log = function(...a) { capture('log', a); origLog.apply(console, a); };
+    console.warn = function(...a) { capture('warn', a); origWarn.apply(console, a); };
+    console.error = function(...a) { capture('error', a); origError.apply(console, a); };
+    console.info = function(...a) { capture('info', a); origInfo.apply(console, a); };
+    console.debug = function(...a) { capture('debug', a); origDebug.apply(console, a); };
+    window.addEventListener('error', function(e) {
+      window.__quiverCtlLogs.errors.push({ ts: Date.now(), message: e.message, filename: e.filename, lineno: e.lineno, colno: e.colno, stack: e.error?.stack });
+      if (window.__quiverCtlLogs.errors.length > MAX) window.__quiverCtlLogs.errors.shift();
+    });
+    window.addEventListener('unhandledrejection', function(e) {
+      window.__quiverCtlLogs.errors.push({ ts: Date.now(), message: 'Unhandled rejection: ' + String(e.reason), stack: e.reason?.stack });
+      if (window.__quiverCtlLogs.errors.length > MAX) window.__quiverCtlLogs.errors.shift();
+    });
+  })()`);
+}
+
 // ── Snapshot with refs ────────────────────────────────────────────────────────
 
 const INTERACTIVE_ROLES = new Set([
@@ -316,7 +496,7 @@ const INTERACTIVE_ROLES = new Set([
   "searchbox", "slider", "spinbutton", "switch", "tab", "treeitem", "listbox",
 ]);
 
-function buildSnapshotInteractive(nodes: AXNode[], targetKey: string): { text: string; count: number } {
+function buildSnapshotInteractive(nodes: AXNode[], targetKey: string, cursorExtras?: Array<{ backendNodeId: number; tag: string; text: string }>): { text: string; count: number } {
   const lines: string[] = [];
   const refs: Record<string, RefRecord> = {};
   let counter = 0;
@@ -343,6 +523,21 @@ function buildSnapshotInteractive(nodes: AXNode[], targetKey: string): { text: s
     lines.push(line);
   }
 
+  // Add cursor-interactive elements not already captured
+  if (cursorExtras) {
+    const existingBackendIds = new Set(Object.values(refs).map(r => r.backendDOMNodeId));
+    for (const extra of cursorExtras) {
+      if (existingBackendIds.has(extra.backendNodeId)) continue;
+      counter++;
+      const refKey = `@e${counter}`;
+      refs[refKey] = { backendDOMNodeId: extra.backendNodeId, role: extra.tag, name: extra.text };
+      let line = `${refKey} ${extra.tag}`;
+      if (extra.text) line += ` "${extra.text}"`;
+      line += " [cursor]";
+      lines.push(line);
+    }
+  }
+
   const store = loadRefs();
   store.targets[targetKey] = { next: counter, refs };
   saveRefs(store);
@@ -355,19 +550,21 @@ function buildSnapshotInteractive(nodes: AXNode[], targetKey: string): { text: s
   return { text: lines.length ? lines.join("\n") : "(no interactive elements found)", count: counter };
 }
 
-function buildSnapshotFull(nodes: AXNode[]): string {
+function buildSnapshotFull(nodes: AXNode[], maxDepth?: number): string {
   const lines: string[] = [];
   const idMap = new Map<string, AXNode>();
   for (const n of nodes) idMap.set(n.nodeId, n);
 
   function walk(nodeId: string, depth: number) {
     const node = idMap.get(nodeId);
-    if (!node || node.ignored) return;
+    if (!node) return;
     const role = node.role?.value;
-    if (!role || role === "none" || role === "generic") {
+    // Transparent nodes: ignored, none, generic — skip rendering, recurse at same depth
+    if (node.ignored || !role || role === "none" || role === "generic") {
       for (const cid of node.childIds ?? []) walk(cid, depth);
       return;
     }
+    if (maxDepth != null && depth > maxDepth) return;
     const name = node.name?.value ?? "";
     const indent = "  ".repeat(depth);
     lines.push(`${indent}- ${role}${name ? ` "${name}"` : ""}`);
@@ -376,6 +573,17 @@ function buildSnapshotFull(nodes: AXNode[]): string {
 
   if (nodes.length > 0) walk(nodes[0].nodeId, 0);
   return lines.length ? lines.join("\n") : "(empty accessibility tree)";
+}
+
+function buildSnapshotCompact(nodes: AXNode[]): string {
+  const lines: string[] = [];
+  for (const node of nodes) {
+    const role = node.role?.value;
+    if (!role || role === "none" || role === "generic" || node.ignored) continue;
+    const name = node.name?.value ?? "";
+    lines.push(`${role}${name ? ` "${name}"` : ""}`);
+  }
+  return lines.length ? lines.join("\n") : "(empty)";
 }
 
 // ── Annotated screenshot ──────────────────────────────────────────────────────
@@ -405,9 +613,9 @@ async function annotatedScreenshot(client: CDPClient, targetKey: string, outPath
 
   const overlayData = JSON.stringify(annotations);
   await evalJS(client, `(() => {
-    document.getElementById('__agent_electrobun_overlay')?.remove();
+    document.getElementById('__quiver_ctl_overlay')?.remove();
     var c = document.createElement('div');
-    c.id = '__agent_electrobun_overlay';
+    c.id = '__quiver_ctl_overlay';
     c.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:2147483647;';
     var items = ${overlayData};
     for (var i = 0; i < items.length; i++) {
@@ -427,7 +635,7 @@ async function annotatedScreenshot(client: CDPClient, targetKey: string, outPath
     const buf = await captureScreenshot(client);
     await Bun.write(outPath, buf);
   } finally {
-    await evalJS(client, `document.getElementById('__agent_electrobun_overlay')?.remove()`).catch(() => {});
+    await evalJS(client, `document.getElementById('__quiver_ctl_overlay')?.remove()`).catch(() => {});
   }
 
   const legend = annotations.map((a) => `  [${a.num}] @e${a.num} ${a.role}${a.name ? ` "${a.name}"` : ""}`).join("\n");
@@ -451,7 +659,13 @@ function parseCliArgs(argv: string[]): { target: string | null; cmd: string; arg
     else if (a === "--fn" && i + 1 < raw.length)   { flags.fn = raw[++i]; }
     else if (a === "--url" && i + 1 < raw.length)  { flags.url = raw[++i]; }
     else if (a === "-i")         { flags.interactive = true; }
+    else if (a === "-c")         { flags.compact = true; }
+    else if (a === "-d" && i + 1 < raw.length) { flags.depth = raw[++i]; }
+    else if (a === "-s" && i + 1 < raw.length) { flags.scope = raw[++i]; }
     else if (a === "-C")         { flags.cursor = true; }
+    else if (a === "--stdin")    { flags.stdin = true; }
+    else if (a === "-b")         { flags.base64 = true; }
+    else if (a === "--clear")    { flags.clear = true; }
     else { positional.push(a); }
   }
 
@@ -489,7 +703,7 @@ async function resolveTarget(targetSpec: string | null, cmdNeedsShell: boolean):
 const { target, cmd, args, flags } = parseCliArgs(process.argv);
 
 if (cmd === "help" || !cmd) {
-  console.log(`agent-electrobun — CDP automation CLI for Electrobun desktop apps
+  console.log(`quiver-ctl — CDP controller for Quiver Electrobun app
 
 Target selection:
   --target shell            Target the shell (mainview)
@@ -517,6 +731,7 @@ Interaction:
   select @e1 "value"              Select dropdown option
   scroll up|down [amount]         Scroll page (default: 400px)
   scrollintoview @e1              Scroll element into view
+  drag @e1 @e2                    Drag element to another element
 
 Mouse:
   mouse move <x> <y>             Move mouse to coordinates
@@ -527,6 +742,8 @@ Mouse:
 Keyboard:
   keyboard type "text"            Type with key events
   keyboard inserttext "text"      Insert text without key events
+  keydown Shift                   Hold key down
+  keyup Shift                     Release key
 
 Get information:
   get text @e1                    Element text content
@@ -549,6 +766,8 @@ Screenshot:
 
 JavaScript:
   eval <js>                       Evaluate JavaScript
+  eval -b <base64>                Evaluate base64-encoded JS
+  eval --stdin                    Read JS from stdin
   shell eval <js>                 Eval in shell webview
 
 Wait:
@@ -563,9 +782,30 @@ Compare:
 Debug:
   highlight @e1                   Highlight element with red border
 
+Dialogs:
+  dialog accept [text]            Accept JS dialog (alert/confirm/prompt)
+  dialog dismiss                  Dismiss JS dialog
+
+Semantic locators:
+  find text "Sign In" click       Find by text content and act
+  find label "Email" fill "text"  Find by label and fill
+  find role button click          Find by ARIA role
+  find placeholder "Search" fill "q"  Find by placeholder
+  find testid "submit" click      Find by data-testid
+  find alt "Logo" click           Find by alt text
+  find title "Close" click        Find by title attribute
+
 Tab management:
   new-tab                         Create a new tab
-  open-repo <path> [tabId]        Open a repo in a tab`);
+  tab switch <tabId>              Switch to a specific tab
+  tab close <tabId>              Close a specific tab
+  open-repo <path> [tabId]        Open a repo in a tab
+
+Console/errors:
+  console                         View captured console messages
+  console --clear                 Clear console buffer
+  errors                          View captured errors
+  errors --clear                  Clear error buffer`);
   process.exit(0);
 }
 
@@ -610,7 +850,7 @@ if (cmd === "new-tab") {
 
 if (cmd === "shell" && args[0] === "eval") {
   const js = args.slice(1).join(" ");
-  if (!js) die("Usage: agent-electrobun shell eval <js>");
+  if (!js) die("Usage: quiver-ctl shell eval <js>");
   const { wsUrl } = await resolveTarget(null, true);
   const client = await CDPClient.connect(wsUrl);
   try { console.log(await evalJS(client, js)); } finally { await client.close(); }
@@ -621,7 +861,7 @@ if (cmd === "shell" && args[0] === "eval") {
 
 if (cmd === "open-repo") {
   const repoPath = args[0];
-  if (!repoPath) die("Usage: agent-electrobun open-repo <path> [tabId]");
+  if (!repoPath) die("Usage: quiver-ctl open-repo <path> [tabId]");
   const targets = await getTargets();
   const shell = findShell(targets);
   if (!shell) die("Shell target not found");
@@ -653,15 +893,55 @@ if (cmd === "open-repo") {
     console.log(`✓ Opening repo in ${tabId}...`);
     await sleep(2000);
     const buf = await captureScreenshot(client);
-    await Bun.write("/tmp/electrobun-open-repo.png", buf);
-    console.log(`✓ Screenshot saved to /tmp/electrobun-open-repo.png`);
+    await Bun.write("/tmp/quiver-open-repo.png", buf);
+    console.log(`✓ Screenshot saved to /tmp/quiver-open-repo.png`);
   } finally { await client.close(); }
+  process.exit(0);
+}
+
+// ── tab switch|close ──────────────────────────────────────────────────────
+
+if (cmd === "tab") {
+  const sub = args[0];
+  if (sub === "switch") {
+    const tabId = args[1];
+    if (!tabId) die("Usage: agent-electrobun tab switch <tabId>");
+    const { wsUrl } = await resolveTarget(null, true);
+    const client = await CDPClient.connect(wsUrl);
+    try {
+      const result = await evalJS(client, `(async () => {
+        if (!window.__quiverAutomation?.activate) return JSON.stringify({ error: 'activate not available on automation bridge' });
+        try { window.__quiverAutomation.activate('${tabId.replace(/'/g, "\\'")}'); return JSON.stringify({ ok: true }); }
+        catch(e) { return JSON.stringify({ error: String(e) }); }
+      })()`);
+      const data = JSON.parse(result);
+      if (data.error) die(`✗ ${data.error}`);
+      console.log(`✓ Switched to tab ${tabId}`);
+    } finally { await client.close(); }
+  } else if (sub === "close") {
+    const tabId = args[1];
+    if (!tabId) die("Usage: agent-electrobun tab close <tabId>");
+    const { wsUrl } = await resolveTarget(null, true);
+    const client = await CDPClient.connect(wsUrl);
+    try {
+      const result = await evalJS(client, `(async () => {
+        if (!window.__quiverAutomation?.closeTab) return JSON.stringify({ error: 'closeTab not available on automation bridge' });
+        try { window.__quiverAutomation.closeTab('${tabId.replace(/'/g, "\\'")}'); return JSON.stringify({ ok: true }); }
+        catch(e) { return JSON.stringify({ error: String(e) }); }
+      })()`);
+      const data = JSON.parse(result);
+      if (data.error) die(`✗ ${data.error}`);
+      console.log(`✓ Closed tab ${tabId}`);
+    } finally { await client.close(); }
+  } else {
+    die("Usage: agent-electrobun tab switch|close <tabId>");
+  }
   process.exit(0);
 }
 
 // ── All other commands need a resolved target ─────────────────────────────────
 
-const shellCmds = new Set(["list", "tabs", "new-tab"]);
+const shellCmds = new Set(["list", "tabs", "new-tab", "tab"]);
 const needsShell = cmd === "shell" || shellCmds.has(cmd);
 const { wsUrl, targetKey } = await resolveTarget(target, needsShell);
 const client = await CDPClient.connect(wsUrl);
@@ -669,19 +949,38 @@ const client = await CDPClient.connect(wsUrl);
 try {
   // ── snapshot ────────────────────────────────────────────────────────────
   if (cmd === "snapshot") {
-    const nodes = await getFullAXTree(client);
+    let nodes: AXNode[];
+    // Determine scope
+    if (args[0]?.startsWith("@")) {
+      const ref = resolveRef(args[0], targetKey);
+      nodes = await getScopedAXTree(client, ref.backendDOMNodeId);
+    } else if (flags.scope) {
+      const backendId = await resolveSelector(client, flags.scope as string);
+      nodes = await getScopedAXTree(client, backendId);
+    } else {
+      nodes = await getFullAXTree(client);
+    }
+
+    const maxDepth = flags.depth ? parseInt(flags.depth as string, 10) : undefined;
+
     if (flags.interactive) {
-      const { text, count } = buildSnapshotInteractive(nodes, targetKey);
+      let cursorExtras: Array<{ backendNodeId: number; tag: string; text: string }> | undefined;
+      if (flags.cursor) {
+        cursorExtras = await collectCursorInteractiveIds(client);
+      }
+      const { text, count } = buildSnapshotInteractive(nodes, targetKey, cursorExtras);
       console.log(text);
       console.error(`(${count} interactive elements, refs saved for target "${targetKey}")`);
+    } else if (flags.compact) {
+      console.log(buildSnapshotCompact(nodes));
     } else {
-      console.log(buildSnapshotFull(nodes));
+      console.log(buildSnapshotFull(nodes, maxDepth));
     }
   }
 
   // ── click @ref ──────────────────────────────────────────────────────────
   else if (cmd === "click") {
-    if (!args[0]) die("Usage: agent-electrobun click @e1");
+    if (!args[0]) die("Usage: quiver-ctl click @e1");
     const { nodeId, ref } = await prepareRef(client, args[0], targetKey);
     const { x, y } = await getBoxCenter(client, nodeId);
     await clickAt(client, x, y);
@@ -690,16 +989,38 @@ try {
 
   // ── dblclick @ref ───────────────────────────────────────────────────────
   else if (cmd === "dblclick") {
-    if (!args[0]) die("Usage: agent-electrobun dblclick @e1");
+    if (!args[0]) die("Usage: quiver-ctl dblclick @e1");
     const { nodeId, ref } = await prepareRef(client, args[0], targetKey);
     const { x, y } = await getBoxCenter(client, nodeId);
     await clickAt(client, x, y, 2);
     console.log(`✓ Double-clicked ${args[0]} (${ref.role}${ref.name ? ` "${ref.name}"` : ""})`);
   }
 
+  // ── drag @e1 @e2 ───────────────────────────────────────────────────────
+  else if (cmd === "drag") {
+    if (!args[0] || !args[1]) die("Usage: agent-electrobun drag @e1 @e2");
+    const { nodeId: srcNodeId, ref: srcRef } = await prepareRef(client, args[0], targetKey);
+    const src = await getBoxCenter(client, srcNodeId);
+    const { nodeId: dstNodeId, ref: dstRef } = await prepareRef(client, args[1], targetKey);
+    const dst = await getBoxCenter(client, dstNodeId);
+    // Move to start, press, interpolate move steps, release
+    await client.call("Input.dispatchMouseEvent", { type: "mouseMoved", x: src.x, y: src.y });
+    await client.call("Input.dispatchMouseEvent", { type: "mousePressed", x: src.x, y: src.y, button: "left", clickCount: 1 });
+    await sleep(50);
+    const steps = 10;
+    for (let i = 1; i <= steps; i++) {
+      const x = src.x + (dst.x - src.x) * (i / steps);
+      const y = src.y + (dst.y - src.y) * (i / steps);
+      await client.call("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+      await sleep(10);
+    }
+    await client.call("Input.dispatchMouseEvent", { type: "mouseReleased", x: dst.x, y: dst.y, button: "left", clickCount: 1 });
+    console.log(`✓ Dragged ${args[0]} (${srcRef.role}${srcRef.name ? ` "${srcRef.name}"` : ""}) → ${args[1]} (${dstRef.role}${dstRef.name ? ` "${dstRef.name}"` : ""})`);
+  }
+
   // ── focus @ref ──────────────────────────────────────────────────────────
   else if (cmd === "focus") {
-    if (!args[0]) die("Usage: agent-electrobun focus @e1");
+    if (!args[0]) die("Usage: quiver-ctl focus @e1");
     const { nodeId, ref } = await prepareRef(client, args[0], targetKey);
     await focusNode(client, nodeId);
     console.log(`✓ Focused ${args[0]} (${ref.role}${ref.name ? ` "${ref.name}"` : ""})`);
@@ -707,7 +1028,7 @@ try {
 
   // ── hover @ref ──────────────────────────────────────────────────────────
   else if (cmd === "hover") {
-    if (!args[0]) die("Usage: agent-electrobun hover @e1");
+    if (!args[0]) die("Usage: quiver-ctl hover @e1");
     const { nodeId, ref } = await prepareRef(client, args[0], targetKey);
     const { x, y } = await getBoxCenter(client, nodeId);
     await client.call("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
@@ -718,7 +1039,7 @@ try {
   else if (cmd === "fill") {
     const refArg = args[0];
     const text = args.slice(1).join(" ");
-    if (!refArg || !text) die('Usage: agent-electrobun fill @e1 "text"');
+    if (!refArg || !text) die('Usage: quiver-ctl fill @e1 "text"');
     const { nodeId, ref } = await prepareRef(client, refArg, targetKey);
     await focusNode(client, nodeId);
     const objectId = await getRemoteObject(client, nodeId);
@@ -742,7 +1063,7 @@ try {
   // ── type "text" ─────────────────────────────────────────────────────────
   else if (cmd === "type") {
     const text = args.join(" ");
-    if (!text) die('Usage: agent-electrobun type "text"');
+    if (!text) die('Usage: quiver-ctl type "text"');
     await client.call("Input.insertText", { text });
     console.log(`✓ Typed "${text}"`);
   }
@@ -750,7 +1071,7 @@ try {
   // ── press <key|combo> ───────────────────────────────────────────────────
   else if (cmd === "press") {
     const combo = args[0];
-    if (!combo) die("Usage: agent-electrobun press Enter | press Control+a");
+    if (!combo) die("Usage: quiver-ctl press Enter | press Control+a");
     const { keyDef, modifiers } = parseKeyCombo(combo);
     const base = { key: keyDef.key, code: keyDef.code, windowsVirtualKeyCode: keyDef.keyCode, nativeVirtualKeyCode: keyDef.keyCode, modifiers };
     await client.call("Input.dispatchKeyEvent", { ...base, type: "keyDown", ...(keyDef.text ? { text: keyDef.text } : {}) });
@@ -759,9 +1080,35 @@ try {
     console.log(`✓ Pressed ${combo}`);
   }
 
+  // ── keydown <key|combo> ─────────────────────────────────────────────────
+  else if (cmd === "keydown") {
+    const combo = args[0];
+    if (!combo) die("Usage: agent-electrobun keydown Shift");
+    const { keyDef, modifiers } = parseKeyCombo(combo);
+    await client.call("Input.dispatchKeyEvent", {
+      type: "keyDown", key: keyDef.key, code: keyDef.code,
+      windowsVirtualKeyCode: keyDef.keyCode, nativeVirtualKeyCode: keyDef.keyCode,
+      modifiers, ...(keyDef.text ? { text: keyDef.text } : {}),
+    });
+    console.log(`✓ Key down: ${combo}`);
+  }
+
+  // ── keyup <key|combo> ───────────────────────────────────────────────────
+  else if (cmd === "keyup") {
+    const combo = args[0];
+    if (!combo) die("Usage: agent-electrobun keyup Shift");
+    const { keyDef, modifiers } = parseKeyCombo(combo);
+    await client.call("Input.dispatchKeyEvent", {
+      type: "keyUp", key: keyDef.key, code: keyDef.code,
+      windowsVirtualKeyCode: keyDef.keyCode, nativeVirtualKeyCode: keyDef.keyCode,
+      modifiers,
+    });
+    console.log(`✓ Key up: ${combo}`);
+  }
+
   // ── check / uncheck @ref ────────────────────────────────────────────────
   else if (cmd === "check" || cmd === "uncheck") {
-    if (!args[0]) die(`Usage: agent-electrobun ${cmd} @e1`);
+    if (!args[0]) die(`Usage: quiver-ctl ${cmd} @e1`);
     const { nodeId, ref } = await prepareRef(client, args[0], targetKey);
     const isChecked = await callOnNode(client, nodeId, "function() { return this.checked; }");
     const want = cmd === "check";
@@ -774,7 +1121,7 @@ try {
 
   // ── select @ref "value" ─────────────────────────────────────────────────
   else if (cmd === "select") {
-    if (!args[0] || !args[1]) die('Usage: agent-electrobun select @e1 "value"');
+    if (!args[0] || !args[1]) die('Usage: quiver-ctl select @e1 "value"');
     const { nodeId, ref } = await prepareRef(client, args[0], targetKey);
     const value = args.slice(1).join(" ");
     const escaped = value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
@@ -795,15 +1142,19 @@ try {
   // ── scroll up|down [amount] ─────────────────────────────────────────────
   else if (cmd === "scroll") {
     const dir = args[0];
-    if (dir !== "up" && dir !== "down") die("Usage: agent-electrobun scroll up|down [amount]");
+    if (dir !== "up" && dir !== "down") die("Usage: quiver-ctl scroll up|down [amount]");
     const amount = parseInt(args[1] ?? "400", 10);
-    await evalJS(client, `window.scrollBy(0, ${dir === "down" ? amount : -amount})`);
+    const deltaY = dir === "down" ? amount : -amount;
+    // Get viewport center for the wheel event target
+    const vp = await client.call("Runtime.evaluate", { expression: "JSON.stringify({w:window.innerWidth,h:window.innerHeight})", returnByValue: true });
+    const { w, h } = JSON.parse(vp.result?.value ?? '{"w":800,"h":600}');
+    await client.call("Input.dispatchMouseEvent", { type: "mouseWheel", x: Math.round(w / 2), y: Math.round(h / 2), deltaX: 0, deltaY });
     console.log(`✓ Scrolled ${dir} ${amount}px`);
   }
 
   // ── scrollintoview @ref ─────────────────────────────────────────────────
   else if (cmd === "scrollintoview" || cmd === "scrollinto") {
-    if (!args[0]) die("Usage: agent-electrobun scrollintoview @e1");
+    if (!args[0]) die("Usage: quiver-ctl scrollintoview @e1");
     const { nodeId, ref } = await prepareRef(client, args[0], targetKey);
     await scrollIntoView(client, nodeId);
     console.log(`✓ Scrolled ${args[0]} (${ref.role}${ref.name ? ` "${ref.name}"` : ""}) into view`);
@@ -814,7 +1165,7 @@ try {
     const sub = args[0];
     if (sub === "move") {
       const x = parseFloat(args[1]), y = parseFloat(args[2]);
-      if (isNaN(x) || isNaN(y)) die("Usage: agent-electrobun mouse move <x> <y>");
+      if (isNaN(x) || isNaN(y)) die("Usage: quiver-ctl mouse move <x> <y>");
       await client.call("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
       console.log(`✓ Mouse moved to (${x}, ${y})`);
     } else if (sub === "down") {
@@ -830,7 +1181,7 @@ try {
       await client.call("Input.dispatchMouseEvent", { type: "mouseWheel", x: 0, y: 0, deltaX: 0, deltaY });
       console.log(`✓ Mouse wheel ${deltaY}`);
     } else {
-      die("Usage: agent-electrobun mouse move|down|up|wheel");
+      die("Usage: quiver-ctl mouse move|down|up|wheel");
     }
   }
 
@@ -838,7 +1189,7 @@ try {
   else if (cmd === "keyboard") {
     const sub = args[0];
     const text = args.slice(1).join(" ");
-    if (!text) die('Usage: agent-electrobun keyboard type|inserttext "text"');
+    if (!text) die('Usage: quiver-ctl keyboard type|inserttext "text"');
     if (sub === "type") {
       // Type char by char with key events
       for (const ch of text) {
@@ -852,13 +1203,13 @@ try {
       await client.call("Input.insertText", { text });
       console.log(`✓ Inserted text "${text}"`);
     } else {
-      die("Usage: agent-electrobun keyboard type|inserttext");
+      die("Usage: quiver-ctl keyboard type|inserttext");
     }
   }
 
   // ── screenshot [path] [--annotate] [--full] ─────────────────────────────
   else if (cmd === "screenshot") {
-    const outPath = args[0] ?? "/tmp/electrobun-screenshot.png";
+    const outPath = args[0] ?? "/tmp/quiver-tab.png";
     if (flags.annotate) {
       console.log(await annotatedScreenshot(client, targetKey, outPath));
     } else {
@@ -870,9 +1221,48 @@ try {
 
   // ── eval <js> ───────────────────────────────────────────────────────────
   else if (cmd === "eval") {
-    const js = args.join(" ");
-    if (!js) die("Usage: agent-electrobun eval <expression>");
+    let js: string;
+    if (flags.stdin) {
+      js = await new Response(Bun.stdin.stream()).text();
+    } else {
+      js = args.join(" ");
+    }
+    if (flags.base64) {
+      js = Buffer.from(js.trim(), "base64").toString("utf-8");
+    }
+    if (!js.trim()) die("Usage: agent-electrobun eval <expression> | eval -b <base64> | eval --stdin");
     console.log(await evalJS(client, js));
+  }
+
+  // ── console [--clear] ───────────────────────────────────────────────────
+  else if (cmd === "console") {
+    await ensureLogHooks(client);
+    if (flags.clear) {
+      await evalJS(client, "window.__quiverCtlLogs.console = []");
+      console.log("✓ Console log buffer cleared");
+    } else {
+      const raw = await evalJS(client, "JSON.stringify(window.__quiverCtlLogs?.console || [])");
+      const entries: Array<{ level: string; ts: number; args: string[] }> = JSON.parse(raw || "[]");
+      if (entries.length === 0) console.log("(no console messages captured)");
+      else for (const e of entries) console.log(`[${e.level}] ${e.args.join(" ")}`);
+    }
+  }
+
+  // ── errors [--clear] ───────────────────────────────────────────────────
+  else if (cmd === "errors") {
+    await ensureLogHooks(client);
+    if (flags.clear) {
+      await evalJS(client, "window.__quiverCtlLogs.errors = []");
+      console.log("✓ Error buffer cleared");
+    } else {
+      const raw = await evalJS(client, "JSON.stringify(window.__quiverCtlLogs?.errors || [])");
+      const entries: Array<{ ts: number; message: string; filename?: string; lineno?: number; stack?: string }> = JSON.parse(raw || "[]");
+      if (entries.length === 0) console.log("(no errors captured)");
+      else for (const e of entries) {
+        console.log(`[error] ${e.message}${e.filename ? ` (${e.filename}:${e.lineno})` : ""}`);
+        if (e.stack) console.log(`  ${e.stack.split("\\n").slice(0, 3).join("\\n  ")}`);
+      }
+    }
   }
 
   // ── wait ────────────────────────────────────────────────────────────────
@@ -889,6 +1279,17 @@ try {
         await sleep(200);
         if (Date.now() - start >= timeout) die(`✗ Timed out waiting for text "${target}"`);
       }
+    } else if (typeof flags.url === "string") {
+      const pattern = flags.url;
+      const start = Date.now();
+      const isGlob = pattern.includes("*");
+      const regex = isGlob ? new RegExp("^" + pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*") + "$") : null;
+      while (Date.now() - start < timeout) {
+        const href = await evalJS(client, "window.location.href");
+        if (regex ? regex.test(href) : href.includes(pattern)) { console.log(`✓ URL matched: ${href}`); break; }
+        await sleep(200);
+        if (Date.now() - start >= timeout) die(`✗ Timed out waiting for URL pattern "${pattern}"`);
+      }
     } else if (typeof flags.fn === "string") {
       // Wait for JS condition
       const expr = flags.fn;
@@ -901,20 +1302,35 @@ try {
       }
     } else {
       const what = args[0];
-      if (!what) die("Usage: agent-electrobun wait <ms|selector> | wait --text | wait --fn");
-      const ms = parseInt(what, 10);
-      if (!isNaN(ms) && String(ms) === what) {
-        await sleep(ms);
-        console.log(`✓ Waited ${ms}ms`);
-      } else {
+      if (!what) die("Usage: quiver-ctl wait <ms|selector|@ref> | wait --text | wait --fn | wait --url");
+      if (what.startsWith("@")) {
+        const ref = resolveRef(what, targetKey);
         const start = Date.now();
         while (Date.now() - start < timeout) {
-          if (await evalJS(client, `!!document.querySelector(${JSON.stringify(what)})`)) {
-            console.log(`✓ Element "${what}" found`);
+          try {
+            await client.call("DOM.describeNode", { backendNodeId: ref.backendDOMNodeId });
+            console.log(`✓ Ref ${what} resolved (${ref.role}${ref.name ? ` "${ref.name}"` : ""})`);
             break;
+          } catch {
+            await sleep(200);
+            if (Date.now() - start >= timeout) die(`✗ Timed out waiting for ref ${what}`);
           }
-          await sleep(200);
-          if (Date.now() - start >= timeout) die(`✗ Timed out waiting for "${what}" (${timeout}ms)`);
+        }
+      } else {
+        const ms = parseInt(what, 10);
+        if (!isNaN(ms) && String(ms) === what) {
+          await sleep(ms);
+          console.log(`✓ Waited ${ms}ms`);
+        } else {
+          const start = Date.now();
+          while (Date.now() - start < timeout) {
+            if (await evalJS(client, `!!document.querySelector(${JSON.stringify(what)})`)) {
+              console.log(`✓ Element "${what}" found`);
+              break;
+            }
+            await sleep(200);
+            if (Date.now() - start >= timeout) die(`✗ Timed out waiting for "${what}" (${timeout}ms)`);
+          }
         }
       }
     }
@@ -926,38 +1342,38 @@ try {
     if (what === "url") { console.log(await evalJS(client, "window.location.href")); }
     else if (what === "title") { console.log(await evalJS(client, "document.title")); }
     else if (what === "text") {
-      if (!args[1]) die("Usage: agent-electrobun get text @e1");
+      if (!args[1]) die("Usage: quiver-ctl get text @e1");
       const { nodeId } = await prepareRef(client, args[1], targetKey);
       console.log(await callOnNode(client, nodeId, "function() { return this.textContent || this.value || ''; }"));
     }
     else if (what === "html") {
-      if (!args[1]) die("Usage: agent-electrobun get html @e1");
+      if (!args[1]) die("Usage: quiver-ctl get html @e1");
       const { nodeId } = await prepareRef(client, args[1], targetKey);
       console.log(await callOnNode(client, nodeId, "function() { return this.innerHTML; }"));
     }
     else if (what === "value") {
-      if (!args[1]) die("Usage: agent-electrobun get value @e1");
+      if (!args[1]) die("Usage: quiver-ctl get value @e1");
       const { nodeId } = await prepareRef(client, args[1], targetKey);
       console.log(await callOnNode(client, nodeId, "function() { return this.value ?? ''; }"));
     }
     else if (what === "attr") {
-      if (!args[1] || !args[2]) die("Usage: agent-electrobun get attr @e1 <name>");
+      if (!args[1] || !args[2]) die("Usage: quiver-ctl get attr @e1 <name>");
       const { nodeId } = await prepareRef(client, args[1], targetKey);
       const attrName = args[2];
       console.log(await callOnNode(client, nodeId, `function() { return this.getAttribute('${attrName.replace(/'/g, "\\'")}'); }`));
     }
     else if (what === "count") {
-      if (!args[1]) die('Usage: agent-electrobun get count ".selector"');
+      if (!args[1]) die('Usage: quiver-ctl get count ".selector"');
       console.log(await evalJS(client, `document.querySelectorAll(${JSON.stringify(args[1])}).length`));
     }
     else if (what === "box") {
-      if (!args[1]) die("Usage: agent-electrobun get box @e1");
+      if (!args[1]) die("Usage: quiver-ctl get box @e1");
       const { nodeId } = await prepareRef(client, args[1], targetKey);
       const rect = await getBoxRect(client, nodeId);
       console.log(JSON.stringify(rect));
     }
     else if (what === "styles") {
-      if (!args[1]) die("Usage: agent-electrobun get styles @e1");
+      if (!args[1]) die("Usage: quiver-ctl get styles @e1");
       const { nodeId } = await prepareRef(client, args[1], targetKey);
       const styles = await callOnNode(client, nodeId, `function() {
         var s = window.getComputedStyle(this);
@@ -971,13 +1387,13 @@ try {
       }`);
       console.log(JSON.stringify(JSON.parse(styles), null, 2));
     }
-    else { die("Usage: agent-electrobun get text|html|value|attr|url|title|count|box|styles"); }
+    else { die("Usage: quiver-ctl get text|html|value|attr|url|title|count|box|styles"); }
   }
 
   // ── is visible|enabled|checked ──────────────────────────────────────────
   else if (cmd === "is") {
     const what = args[0];
-    if (!args[1]) die(`Usage: agent-electrobun is ${what ?? "visible|enabled|checked"} @e1`);
+    if (!args[1]) die(`Usage: quiver-ctl is ${what ?? "visible|enabled|checked"} @e1`);
     const { nodeId, ref } = await prepareRef(client, args[1], targetKey);
 
     if (what === "visible") {
@@ -997,18 +1413,18 @@ try {
       const checked = await callOnNode(client, nodeId, "function() { return !!this.checked; }");
       console.log(checked ? "true" : "false");
     }
-    else { die("Usage: agent-electrobun is visible|enabled|checked @e1"); }
+    else { die("Usage: quiver-ctl is visible|enabled|checked @e1"); }
   }
 
   // ── highlight @ref ──────────────────────────────────────────────────────
   else if (cmd === "highlight") {
-    if (!args[0]) die("Usage: agent-electrobun highlight @e1");
+    if (!args[0]) die("Usage: quiver-ctl highlight @e1");
     const { nodeId, ref } = await prepareRef(client, args[0], targetKey);
     const rect = await getBoxRect(client, nodeId);
     await evalJS(client, `(() => {
-      document.getElementById('__agent_electrobun_highlight')?.remove();
+      document.getElementById('__quiver_ctl_highlight')?.remove();
       var d = document.createElement('div');
-      d.id = '__agent_electrobun_highlight';
+      d.id = '__quiver_ctl_highlight';
       d.style.cssText = 'position:fixed;left:${rect.x}px;top:${rect.y}px;width:${rect.width}px;height:${rect.height}px;border:3px solid red;background:rgba(255,0,0,0.1);pointer-events:none;z-index:2147483647;box-sizing:border-box;transition:opacity 3s;';
       document.documentElement.appendChild(d);
       setTimeout(function() { d.style.opacity = '0'; }, 2000);
@@ -1045,9 +1461,103 @@ try {
     }
   }
 
+  // ── dialog accept|dismiss ───────────────────────────────────────────────
+  else if (cmd === "dialog") {
+    const sub = args[0];
+    if (sub === "accept") {
+      const promptText = args.slice(1).join(" ") || undefined;
+      // Listen for dialog event, then handle it
+      const dialogPromise = client.once("Page.javascriptDialogOpening", 10_000).catch(() => null);
+      // Check if a dialog is already open by trying to handle it immediately
+      try {
+        await client.call("Page.handleJavaScriptDialog", { accept: true, ...(promptText ? { promptText } : {}) }, 1000);
+        console.log(`✓ Accepted dialog${promptText ? ` with text "${promptText}"` : ""}`);
+      } catch {
+        // No dialog open yet, wait for one
+        console.error("Waiting for dialog...");
+        const params = await dialogPromise;
+        if (!params) die("✗ No dialog appeared within 10s");
+        await client.call("Page.handleJavaScriptDialog", { accept: true, ...(promptText ? { promptText } : {}) });
+        console.log(`✓ Accepted ${params.type} dialog: "${params.message}"${promptText ? ` with text "${promptText}"` : ""}`);
+      }
+    } else if (sub === "dismiss") {
+      try {
+        await client.call("Page.handleJavaScriptDialog", { accept: false }, 1000);
+        console.log("✓ Dismissed dialog");
+      } catch {
+        console.error("Waiting for dialog...");
+        const params = await client.once("Page.javascriptDialogOpening", 10_000).catch(() => null);
+        if (!params) die("✗ No dialog appeared within 10s");
+        await client.call("Page.handleJavaScriptDialog", { accept: false });
+        console.log(`✓ Dismissed ${params.type} dialog: "${params.message}"`);
+      }
+    } else {
+      die("Usage: agent-electrobun dialog accept [text] | dialog dismiss");
+    }
+  }
+
+  // ── find <strategy> <value> <action> [args] ────────────────────────────
+  else if (cmd === "find") {
+    const strategy = args[0];
+    const value = args[1];
+    const action = args[2];
+    if (!strategy || !value || !action) die('Usage: agent-electrobun find text|label|role|placeholder|alt|title|testid "value" click|fill|hover|focus|get [args]');
+    const { objectId, backendNodeId, nodeId } = await findElement(client, strategy, value);
+    await scrollIntoView(client, nodeId);
+
+    if (action === "click") {
+      const { x, y } = await getBoxCenter(client, nodeId);
+      await clickAt(client, x, y);
+      console.log(`✓ Clicked ${strategy}="${value}" at (${Math.round(x)}, ${Math.round(y)})`);
+    } else if (action === "dblclick") {
+      const { x, y } = await getBoxCenter(client, nodeId);
+      await clickAt(client, x, y, 2);
+      console.log(`✓ Double-clicked ${strategy}="${value}"`);
+    } else if (action === "hover") {
+      const { x, y } = await getBoxCenter(client, nodeId);
+      await client.call("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+      console.log(`✓ Hovered ${strategy}="${value}"`);
+    } else if (action === "focus") {
+      await focusNode(client, nodeId);
+      console.log(`✓ Focused ${strategy}="${value}"`);
+    } else if (action === "fill") {
+      const text = args.slice(3).join(" ");
+      if (!text) die("Usage: find ... fill <text>");
+      await focusNode(client, nodeId);
+      const escaped = text.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+      await client.call("Runtime.callFunctionOn", {
+        objectId,
+        functionDeclaration: `function() {
+          var text = '${escaped}';
+          var nativeSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
+            || Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+          if (nativeSetter) { nativeSetter.call(this, text); }
+          else { this.value = text; }
+          this.dispatchEvent(new Event('input', { bubbles: true }));
+          this.dispatchEvent(new Event('change', { bubbles: true }));
+        }`,
+        returnByValue: true,
+      });
+      console.log(`✓ Filled ${strategy}="${value}" with "${text}"`);
+    } else if (action === "get") {
+      const what = args[3] ?? "text";
+      if (what === "text") {
+        console.log(await callOnNode(client, nodeId, "function() { return this.textContent || this.value || ''; }"));
+      } else if (what === "html") {
+        console.log(await callOnNode(client, nodeId, "function() { return this.innerHTML; }"));
+      } else if (what === "value") {
+        console.log(await callOnNode(client, nodeId, "function() { return this.value ?? ''; }"));
+      } else {
+        console.log(await callOnNode(client, nodeId, `function() { return this.getAttribute('${what.replace(/'/g, "\\'")}'); }`));
+      }
+    } else {
+      die(`Unknown find action: ${action}. Use: click, dblclick, hover, focus, fill, get`);
+    }
+  }
+
   // ── unknown ─────────────────────────────────────────────────────────────
   else {
-    die(`Unknown command: ${cmd}. Run 'agent-electrobun help' for usage.`);
+    die(`Unknown command: ${cmd}. Run 'quiver-ctl help' for usage.`);
   }
 } finally {
   await client.close();
