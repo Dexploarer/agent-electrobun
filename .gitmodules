@@ -1,0 +1,12 @@
+[submodule "vendor/electrobun-dawn"]
+	path = vendor/electrobun-dawn
+	url = https://github.com/blackboardsh/electrobun-dawn.git
+	shallow = true
+[submodule "vendor/dawn"]
+	path = vendor/dawn
+	url = https://github.com/blackboardsh/dawn.git
+	shallow = true
+[submodule "vendor/WebKit"]
+	path = vendor/WebKit
+	url = https://github.com/blackboardsh/WebKit.git
+	shallow = true

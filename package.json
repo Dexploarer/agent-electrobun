@@ -13,7 +13,9 @@
     "dev": "bun scripts/dev.ts",
     "dev:vite": "vite --port 5173",
     "dev:bun": "bun scripts/dev-bun.ts",
-    "build": "vite build && electrobun build"
+    "build": "vite build && electrobun build",
+    "setup:vendor": "bun scripts/setup-vendor.ts",
+    "setup:vendor:all": "bun scripts/setup-vendor.ts --webkit"
   },
   "keywords": ["electrobun", "cdp", "automation", "testing", "browser", "ai-agent", "accessibility"],
   "license": "MIT",
