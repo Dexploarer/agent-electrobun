@@ -1,4 +1,8 @@
 node_modules/
+dist/
+build/
+bun.lock
+*.node
 /tmp/
 *.log
 .DS_Store
