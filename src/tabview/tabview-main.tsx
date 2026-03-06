@@ -10,13 +10,14 @@ const CodeEditorSlate = lazy(() => import("./app/slates/CodeEditorSlate"));
 const TerminalSlate = lazy(() => import("./app/slates/TerminalSlate"));
 const WebSlate = lazy(() => import("./app/slates/WebSlate"));
 const GitSlate = lazy(() => import("./app/slates/GitSlate"));
+const SearchSlate = lazy(() => import("./app/slates/SearchSlate"));
+const SettingsSlate = lazy(() => import("./app/slates/SettingsSlate"));
 
 const params = new URLSearchParams(window.location.search);
 const tabId = params.get("tabId") ?? "unknown";
 const webviewId: number = (window as any).__electrobunWebviewId;
 
-// Extract tab metadata from hash (set by bun backend via URL params)
-const hashParams = new URLSearchParams(window.location.hash.slice(1));
+// Extract tab metadata from URL params
 const tabKind: TabKind = (params.get("kind") as TabKind) ?? "welcome";
 const filePath = params.get("filePath") ?? undefined;
 const tabUrl = params.get("url") ?? undefined;
@@ -70,6 +71,10 @@ function TabContent() {
         <WebSlate initialUrl={tabUrl} />
       ) : tabKind === "git" ? (
         <GitSlate repoRoot={repoRoot} />
+      ) : tabKind === "search" ? (
+        <SearchSlate />
+      ) : tabKind === "settings" ? (
+        <SettingsSlate />
       ) : (
         <WelcomeSlate />
       )}

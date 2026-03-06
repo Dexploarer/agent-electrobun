@@ -1,7 +1,15 @@
-import { Zap, Terminal, Globe, GitBranch, FileText, Code2 } from "lucide-react";
+import { Zap, Terminal, Globe, GitBranch, FileText, Search, Settings } from "lucide-react";
 
 export default function WelcomeSlate() {
   const rpc = (window as any).__demoRpc;
+
+  const openFileDialog = async () => {
+    if (!rpc) return;
+    try {
+      const { files } = await rpc.request.open_file_dialog({});
+      // Files opened via dialog will be handled by the backend
+    } catch {}
+  };
 
   return (
     <div className="flex items-center justify-center h-full">
@@ -14,10 +22,12 @@ export default function WelcomeSlate() {
         </div>
 
         <div className="grid grid-cols-2 gap-3 mb-8">
-          <QuickAction icon={<FileText size={18} />} label="Open File" shortcut="Cmd+O" color="blue" />
+          <QuickAction icon={<FileText size={18} />} label="Open File" shortcut="Cmd+O" color="blue" onClick={openFileDialog} />
           <QuickAction icon={<Terminal size={18} />} label="Terminal" shortcut="Cmd+Shift+`" color="green" />
-          <QuickAction icon={<Globe size={18} />} label="Browser" shortcut="Cmd+T" color="purple" />
+          <QuickAction icon={<Search size={18} />} label="Search" shortcut="Cmd+P" color="purple" />
           <QuickAction icon={<GitBranch size={18} />} label="Git" shortcut="" color="orange" />
+          <QuickAction icon={<Globe size={18} />} label="Browser" shortcut="" color="cyan" />
+          <QuickAction icon={<Settings size={18} />} label="Settings" shortcut="Cmd+," color="gray" />
         </div>
 
         <div className="rounded-xl border border-white/10 bg-white/[0.03] p-5">
@@ -36,7 +46,7 @@ export default function WelcomeSlate() {
 
         <div className="mt-6 text-center">
           <p className="text-xs text-white/20">
-            Cmd+B toggle sidebar &middot; Cmd+T new tab &middot; Cmd+W close tab
+            Cmd+B toggle sidebar &middot; Cmd+T new tab &middot; Cmd+W close tab &middot; Cmd+P search &middot; Cmd+, settings
           </p>
         </div>
       </div>
@@ -44,22 +54,27 @@ export default function WelcomeSlate() {
   );
 }
 
-function QuickAction({ icon, label, shortcut, color }: {
-  icon: React.ReactNode; label: string; shortcut: string; color: string;
+function QuickAction({ icon, label, shortcut, color, onClick }: {
+  icon: React.ReactNode; label: string; shortcut: string; color: string; onClick?: () => void;
 }) {
   const colorMap: Record<string, string> = {
     blue: "border-blue-500/20 hover:border-blue-500/40 text-blue-400",
     green: "border-green-500/20 hover:border-green-500/40 text-green-400",
     purple: "border-violet-500/20 hover:border-violet-500/40 text-violet-400",
     orange: "border-orange-500/20 hover:border-orange-500/40 text-orange-400",
+    cyan: "border-cyan-500/20 hover:border-cyan-500/40 text-cyan-400",
+    gray: "border-neutral-500/20 hover:border-neutral-500/40 text-neutral-400",
   };
   return (
-    <div className={`flex items-center gap-3 p-4 rounded-xl border bg-white/[0.02] hover:bg-white/[0.05] transition-all cursor-default ${colorMap[color]}`}>
+    <button
+      onClick={onClick}
+      className={`flex items-center gap-3 p-4 rounded-xl border bg-white/[0.02] hover:bg-white/[0.05] transition-all cursor-pointer text-left ${colorMap[color] ?? colorMap.gray}`}
+    >
       {icon}
       <div>
         <p className="text-sm font-medium text-white">{label}</p>
         {shortcut && <p className="text-[10px] text-white/30">{shortcut}</p>}
       </div>
-    </div>
+    </button>
   );
 }

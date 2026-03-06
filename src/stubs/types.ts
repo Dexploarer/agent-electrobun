@@ -13,7 +13,7 @@ export type Tab = {
   repoRoot?: string;
 };
 
-export type TabKind = "file" | "terminal" | "web" | "git" | "welcome";
+export type TabKind = "file" | "terminal" | "web" | "git" | "welcome" | "search" | "settings";
 
 export type PaneLayout =
   | { type: "pane"; id: string; tabIds: string[]; activeTabId: string }

@@ -25,8 +25,41 @@ async function getViewUrl(): Promise<string> {
   return "views://mainview/index.html";
 }
 
-function getTabViewUrl(tabId: string): string {
-  return `${DEV_SERVER_URL}/tabview/index.html?tabId=${encodeURIComponent(tabId)}`;
+function getTabViewUrl(tab: Tab): string {
+  const params = new URLSearchParams({ tabId: tab.id, kind: tab.kind });
+  if (tab.filePath) params.set("filePath", tab.filePath);
+  if (tab.url) params.set("url", tab.url);
+  if (tab.cwd) params.set("cwd", tab.cwd);
+  if (tab.repoRoot) params.set("repoRoot", tab.repoRoot);
+  return `${DEV_SERVER_URL}/tabview/index.html?${params.toString()}`;
+}
+
+// ── State persistence ─────────────────────────────────────────────────────────
+
+const STATE_FILE = join(process.env.HOME ?? "/tmp", ".agent-workspace-state.json");
+
+interface PersistedState {
+  tabs: Tab[];
+  activeTabId: string;
+  paneLayout: PaneLayout;
+  nextId: number;
+  projectRoots: string[];
+}
+
+function saveState() {
+  try {
+    const state: PersistedState = { tabs, activeTabId, paneLayout, nextId, projectRoots };
+    writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), "utf-8");
+  } catch {}
+}
+
+function loadState(): PersistedState | null {
+  try {
+    if (!existsSync(STATE_FILE)) return null;
+    const data = JSON.parse(readFileSync(STATE_FILE, "utf-8"));
+    if (data.tabs?.length > 0) return data;
+  } catch {}
+  return null;
 }
 
 // ── Tab manager ───────────────────────────────────────────────────────────────
@@ -42,14 +75,21 @@ function makeTab(kind: TabKind = "welcome", opts: Partial<Tab> = {}): Tab {
     opts.url ? opts.url :
     kind === "terminal" ? "Terminal" :
     kind === "git" ? "Git" :
+    kind === "search" ? "Search" :
+    kind === "settings" ? "Settings" :
     "Welcome";
   return { id, label, kind, ...opts };
 }
 
-let tabs: Tab[] = [makeTab("welcome")];
-let activeTabId: string = tabs[0].id;
+// Restore state or start fresh
+const restored = loadState();
+let tabs: Tab[] = restored?.tabs.filter((t) => t.kind !== "terminal") ?? [makeTab("welcome")];
+let activeTabId: string = restored?.activeTabId ?? tabs[0].id;
+if (restored?.nextId) nextId = restored.nextId;
+if (!tabs.some((t) => t.id === activeTabId)) activeTabId = tabs[0].id;
+
 const closedStack: Tab[] = [];
-let paneLayout: PaneLayout = {
+let paneLayout: PaneLayout = restored?.paneLayout ?? {
   type: "pane", id: "root-pane", tabIds: [tabs[0].id], activeTabId: tabs[0].id,
 };
 
@@ -62,6 +102,7 @@ function throttle(): boolean {
 
 function pushState() {
   shellRpc.send("tabState", { tabs: [...tabs], activeTabId, paneLayout });
+  saveState();
 }
 
 function tabAdd(kind: TabKind = "welcome", opts: Partial<Tab> = {}) {
@@ -134,9 +175,62 @@ function handleTabAction(action: TabAction) {
   }
 }
 
+// ── Pane splitting ───────────────────────────────────────────────────────────
+let nextPaneId = 1;
+
+function findPane(layout: PaneLayout, paneId: string): PaneLayout | null {
+  if (layout.type === "pane" && layout.id === paneId) return layout;
+  if (layout.type === "container") {
+    for (const child of layout.children) {
+      const found = findPane(child, paneId);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+function replacePane(layout: PaneLayout, paneId: string, replacement: PaneLayout): PaneLayout {
+  if (layout.type === "pane" && layout.id === paneId) return replacement;
+  if (layout.type === "container") {
+    return {
+      ...layout,
+      children: layout.children.map((child) => replacePane(child, paneId, replacement)),
+    };
+  }
+  return layout;
+}
+
+function splitPane(paneId: string, direction: "row" | "column") {
+  const existing = findPane(paneLayout, paneId);
+  if (!existing || existing.type !== "pane") return;
+
+  // Create a new tab for the new pane
+  const newTab = makeTab("welcome");
+  tabs = [...tabs, newTab];
+
+  const newPaneId = `pane-${nextPaneId++}`;
+  const newPane: PaneLayout = {
+    type: "pane",
+    id: newPaneId,
+    tabIds: [newTab.id],
+    activeTabId: newTab.id,
+  };
+
+  const container: PaneLayout = {
+    type: "container",
+    direction,
+    children: [existing, newPane],
+    sizes: [50, 50],
+  };
+
+  paneLayout = replacePane(paneLayout, paneId, container);
+  activeTabId = newTab.id;
+  pushState();
+}
+
 // ── File tree ─────────────────────────────────────────────────────────────────
 
-const projectRoots: string[] = [process.cwd()];
+const projectRoots: string[] = restored?.projectRoots?.length ? restored.projectRoots : [process.cwd()];
 
 function readDirTree(dirPath: string, depth = 1): FileNode[] {
   try {
@@ -236,6 +330,11 @@ const menuConfig = [
       { type: "separator" },
       { type: "normal", label: "Open File...", action: "file:open", accelerator: "cmd+o" },
       { type: "normal", label: "Open Folder...", action: "folder:open", accelerator: "cmd+shift+o" },
+      { type: "separator" },
+      { type: "normal", label: "Search Files", action: "search:open", accelerator: "cmd+p" },
+      { type: "normal", label: "Search in Files", action: "search:content", accelerator: "cmd+shift+f" },
+      { type: "separator" },
+      { type: "normal", label: "Settings", action: "settings:open", accelerator: "cmd+," },
     ],
   },
   {
@@ -250,12 +349,25 @@ const menuConfig = [
     submenu: [
       { type: "normal", label: "Previous Tab", action: "tab:prev", accelerator: "cmd+shift+[" },
       { type: "normal", label: "Next Tab", action: "tab:next", accelerator: "cmd+shift+]" },
+      { type: "separator" },
+      { type: "normal", label: "Split Right", action: "split:right", accelerator: "cmd+\\" },
+      { type: "normal", label: "Split Down", action: "split:down", accelerator: "cmd+shift+\\" },
+      { type: "separator" },
       ...[1,2,3,4,5,6,7,8,9].map((n) => ({
         type: "normal", label: `Tab ${n}`, action: `tab:${n}`, accelerator: `cmd+${n}`,
       })),
     ],
   },
 ];
+
+const helpMenu = {
+  label: "Help",
+  submenu: [
+    { type: "normal", label: "About Agent Workspace", action: "help:about" },
+    { type: "normal", label: "Keyboard Shortcuts", action: "help:shortcuts" },
+  ],
+};
+menuConfig.push(helpMenu as any);
 
 ApplicationMenu.setApplicationMenu(menuConfig as any);
 
@@ -267,7 +379,9 @@ const shellRpc = BrowserView.defineRPC<any>({
     requests: {},
     messages: {
       tabAction: (action: TabAction) => handleTabAction(action),
-      splitPane: () => {},
+      splitPane: ({ paneId, direction }: { paneId: string; direction: "row" | "column" }) => {
+        splitPane(paneId, direction);
+      },
     },
   },
 });
@@ -289,8 +403,26 @@ ApplicationMenu.on("application-menu-clicked", (e) => {
   else if (action === "folder:open") {
     Utils.openFileDialog({ canChooseFiles: false, canChooseDirectory: true, allowsMultipleSelection: false })
       .then((dirs: string[]) => {
-        if (dirs[0]) { projectRoots.push(dirs[0]); pushFileTree(); }
+        if (dirs[0]) { projectRoots.push(dirs[0]); pushFileTree(); saveState(); }
       });
+  }
+  else if (action === "search:open" || action === "search:content") {
+    handleTabAction({ type: "add", kind: "search" });
+  }
+  else if (action === "settings:open") {
+    handleTabAction({ type: "add", kind: "settings" });
+  }
+  else if (action === "split:right") {
+    splitPane("root-pane", "row");
+  }
+  else if (action === "split:down") {
+    splitPane("root-pane", "column");
+  }
+  else if (action === "help:shortcuts") {
+    handleTabAction({ type: "add", kind: "settings" });
+  }
+  else if (action === "help:about") {
+    handleTabAction({ type: "add", kind: "welcome" });
   }
   else if (action.startsWith("tab:") && !isNaN(Number(action.slice(4)))) {
     handleTabAction({ type: "byIndex", index: Number(action.slice(4)) - 1 });
@@ -456,6 +588,7 @@ const mainWindow = new BrowserWindow({
 });
 
 mainWindow.on("close", () => {
+  saveState();
   terminals.forEach((t) => t.proc.kill());
   Utils.quit();
 });

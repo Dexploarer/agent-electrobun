@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
-import { Plus, X, FileText, Terminal, Globe, GitBranch, ChevronRight, ChevronDown, FolderOpen, File, Search, Layers } from "lucide-react";
+import { Plus, X, FileText, Terminal, Globe, GitBranch, ChevronRight, ChevronDown, FolderOpen, File, Search, Layers, Settings } from "lucide-react";
 import { Electroview } from "electrobun/view";
 import type { ShellRPC, Tab, TabAction, FileNode, PaneLayout, TabKind } from "../stubs/types";
 
@@ -35,11 +35,16 @@ type WebviewTagElement = HTMLElement & {
 
 const webviewRefs = new Map<string, WebviewTagElement>();
 
-function getTabViewUrl(tabId: string): string {
+function getTabViewUrl(tab: Tab): string {
   const base = window.location.hostname === "localhost"
     ? "http://localhost:5173/tabview/index.html"
     : "views://tabview/index.html";
-  return `${base}?tabId=${encodeURIComponent(tabId)}`;
+  const params = new URLSearchParams({ tabId: tab.id, kind: tab.kind });
+  if (tab.filePath) params.set("filePath", tab.filePath);
+  if (tab.url) params.set("url", tab.url);
+  if (tab.cwd) params.set("cwd", tab.cwd);
+  if (tab.repoRoot) params.set("repoRoot", tab.repoRoot);
+  return `${base}?${params.toString()}`;
 }
 
 function syncVisibility(activeId: string) {
@@ -57,6 +62,8 @@ function getTabIcon(kind: string, size = 12) {
     case "terminal": return <Terminal size={size} />;
     case "web": return <Globe size={size} />;
     case "git": return <GitBranch size={size} />;
+    case "search": return <Search size={size} />;
+    case "settings": return <Settings size={size} />;
     default: return <Layers size={size} />;
   }
 }
@@ -106,8 +113,11 @@ function Sidebar({ fileRoots, onNewTab }: { fileRoots: FileNode[]; onNewTab: (ki
         <button onClick={() => onNewTab("git")} className="p-1.5 rounded-md text-neutral-600 hover:text-neutral-300 hover:bg-white/[0.06] transition-all" title="Git">
           <GitBranch size={14} />
         </button>
-        <button onClick={() => onNewTab("file")} className="p-1.5 rounded-md text-neutral-600 hover:text-neutral-300 hover:bg-white/[0.06] transition-all" title="Search">
+        <button onClick={() => onNewTab("search")} className="p-1.5 rounded-md text-neutral-600 hover:text-neutral-300 hover:bg-white/[0.06] transition-all" title="Search">
           <Search size={14} />
+        </button>
+        <button onClick={() => onNewTab("settings")} className="p-1.5 rounded-md text-neutral-600 hover:text-neutral-300 hover:bg-white/[0.06] transition-all" title="Settings">
+          <Settings size={14} />
         </button>
       </div>
       <div className="flex-1 overflow-y-auto py-1">
@@ -125,19 +135,74 @@ function Sidebar({ fileRoots, onNewTab }: { fileRoots: FileNode[]; onNewTab: (ki
   );
 }
 
+// ── Pane Layout Renderer ─────────────────────────────────────────────────────
+
+function PaneLayoutView({
+  layout, tabs, activeTabId, mountedIds,
+}: {
+  layout: PaneLayout; tabs: Tab[]; activeTabId: string; mountedIds: Set<string>;
+}) {
+  if (layout.type === "pane") {
+    // Render the active tab's webview for this pane
+    const tabsInPane = tabs.filter((t) => layout.tabIds.includes(t.id) && mountedIds.has(t.id));
+    return (
+      <div className="flex-1 min-h-0 min-w-0 relative">
+        {tabsInPane.map((tab) => (
+          <electrobun-webview
+            key={tab.id}
+            src={getTabViewUrl(tab)}
+            transparent={tab.id !== activeTabId ? "" : undefined}
+            style={{ position: "absolute", inset: 0, width: "100%", height: "100%" }}
+            ref={(el: WebviewTagElement | null) => {
+              if (el) {
+                webviewRefs.set(tab.id, el);
+                if (tab.id !== activeTabId) { el.toggleTransparent(true); el.togglePassthrough(true); }
+              }
+            }}
+          />
+        ))}
+      </div>
+    );
+  }
+
+  // Container: render children in a flex row/column
+  return (
+    <div className={`flex flex-1 min-h-0 min-w-0 ${layout.direction === "row" ? "flex-row" : "flex-col"}`}>
+      {layout.children.map((child, i) => (
+        <div
+          key={i}
+          className="min-h-0 min-w-0"
+          style={{ flex: `${layout.sizes[i]} 0 0%` }}
+        >
+          {i > 0 && (
+            <div className={`${layout.direction === "row" ? "w-[1px] h-full" : "h-[1px] w-full"} bg-white/[0.06]`} />
+          )}
+          <PaneLayoutView layout={child} tabs={tabs} activeTabId={activeTabId} mountedIds={mountedIds} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function splitPaneAction(paneId: string, direction: "row" | "column") {
+  shellRpc.send("splitPane", { paneId, direction });
+}
+
 // ── App ───────────────────────────────────────────────────────────────────────
 
 export function App() {
   const [tabs, setTabs] = useState<Tab[]>([]);
   const [activeTabId, setActiveTabId] = useState("");
+  const [layout, setLayout] = useState<PaneLayout>({ type: "pane", id: "root-pane", tabIds: [], activeTabId: "" });
   const [mountedIds, setMountedIds] = useState<Set<string>>(new Set());
   const [fileRoots, setFileRoots] = useState<FileNode[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(true);
 
   useEffect(() => {
-    _setTabState = (newTabs, newActiveId) => {
+    _setTabState = (newTabs, newActiveId, newLayout) => {
       setTabs(newTabs);
       setActiveTabId(newActiveId);
+      if (newLayout) setLayout(newLayout);
       setMountedIds((prev) => {
         const incoming = new Set(newTabs.map((t) => t.id));
         const toAdd = [...incoming].filter((id) => !prev.has(id));
@@ -173,6 +238,10 @@ export function App() {
       else if (e.shiftKey && e.key === "]") { e.preventDefault(); sendAction({ type: "next" }); }
       else if (e.shiftKey && e.key === "[") { e.preventDefault(); sendAction({ type: "prev" }); }
       else if (e.key === "b" && !e.shiftKey) { e.preventDefault(); setSidebarOpen((v) => !v); }
+      else if (e.shiftKey && e.key === "F") { e.preventDefault(); sendAction({ type: "add", kind: "search" }); }
+      else if (e.key === "," && !e.shiftKey) { e.preventDefault(); sendAction({ type: "add", kind: "settings" }); }
+      else if (e.key === "p" && !e.shiftKey) { e.preventDefault(); sendAction({ type: "add", kind: "search" }); }
+      else if (e.key === "\\" && !e.shiftKey) { e.preventDefault(); splitPaneAction("root-pane", "row"); }
       else if (e.key >= "1" && e.key <= "9") { e.preventDefault(); sendAction({ type: "byIndex", index: Number(e.key) - 1 }); }
     };
     window.addEventListener("keydown", handler);
@@ -228,23 +297,27 @@ export function App() {
           </button>
         </div>
 
-        {/* Webviews */}
-        <div className="flex-1 min-h-0 relative">
-          {tabs.filter((tab) => mountedIds.has(tab.id)).map((tab) => (
-            <electrobun-webview
-              key={tab.id}
-              src={getTabViewUrl(tab.id)}
-              transparent={tab.id !== activeTabId ? "" : undefined}
-              style={{ position: "absolute", inset: 0, width: "100%", height: "100%" }}
-              ref={(el: WebviewTagElement | null) => {
-                if (el) {
-                  webviewRefs.set(tab.id, el);
-                  if (tab.id !== activeTabId) { el.toggleTransparent(true); el.togglePassthrough(true); }
-                }
-              }}
-            />
-          ))}
-        </div>
+        {/* Webviews via PaneLayout */}
+        {layout.type === "pane" ? (
+          <div className="flex-1 min-h-0 relative">
+            {tabs.filter((tab) => mountedIds.has(tab.id)).map((tab) => (
+              <electrobun-webview
+                key={tab.id}
+                src={getTabViewUrl(tab)}
+                transparent={tab.id !== activeTabId ? "" : undefined}
+                style={{ position: "absolute", inset: 0, width: "100%", height: "100%" }}
+                ref={(el: WebviewTagElement | null) => {
+                  if (el) {
+                    webviewRefs.set(tab.id, el);
+                    if (tab.id !== activeTabId) { el.toggleTransparent(true); el.togglePassthrough(true); }
+                  }
+                }}
+              />
+            ))}
+          </div>
+        ) : (
+          <PaneLayoutView layout={layout} tabs={tabs} activeTabId={activeTabId} mountedIds={mountedIds} />
+        )}
       </div>
     </div>
   );
