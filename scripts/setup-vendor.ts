@@ -2,7 +2,7 @@
 // Initialise vendor submodules with shallow clones to minimise disk usage.
 // Usage: bun scripts/setup-vendor.ts [--webkit]
 //
-// By default only electrobun-dawn is fetched (includes dawn as a nested submodule).
+// By default electrobun-dawn and colab are fetched.
 // Pass --webkit to also fetch the WebKit fork (~11.6 GB).
 
 import { spawn } from "bun";
@@ -11,6 +11,7 @@ const includeWebKit = process.argv.includes("--webkit");
 
 const modules = [
   "vendor/electrobun-dawn",
+  "vendor/colab",
   ...(includeWebKit ? ["vendor/WebKit"] : []),
 ];
 

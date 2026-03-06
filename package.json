@@ -1,8 +1,8 @@
 {
   "name": "agent-electrobun",
   "private": true,
-  "version": "0.1.0",
-  "description": "CDP automation CLI for Electrobun desktop apps. Like agent-browser, but for OOPIF-based Electrobun apps.",
+  "version": "0.2.0",
+  "description": "Agent workspace: hybrid browser + code editor + terminal for AI agents. Built on Electrobun + co(lab).",
   "type": "module",
   "bin": {
     "agent-electrobun": "src/agent-electrobun.ts"
@@ -17,7 +17,7 @@
     "setup:vendor": "bun scripts/setup-vendor.ts",
     "setup:vendor:all": "bun scripts/setup-vendor.ts --webkit"
   },
-  "keywords": ["electrobun", "cdp", "automation", "testing", "browser", "ai-agent", "accessibility"],
+  "keywords": ["electrobun", "colab", "monaco", "xterm", "browser", "code-editor", "ai-agent", "workspace"],
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -30,10 +30,17 @@
     "@tailwindcss/vite": "^4.1.18",
     "@tanstack/react-query": "^5.90.21",
     "@tanstack/react-router": "^1.159.5",
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/addon-search": "^0.15.0",
+    "@xterm/addon-web-links": "^0.11.0",
+    "@xterm/xterm": "^5.5.0",
+    "ansi-to-html": "^0.7.2",
     "electrobun": "latest",
     "lucide-react": "^0.563.0",
+    "monaco-editor": "0.52.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
+    "simple-git": "^3.22.0",
     "tailwindcss": "^4.1.18"
   },
   "patchedDependencies": {
@@ -47,6 +54,7 @@
     "@vitejs/plugin-react": "^4.6.0",
     "babel-plugin-react-compiler": "^1.0.0",
     "typescript": "~5.8.3",
-    "vite": "^7.0.4"
+    "vite": "^7.0.4",
+    "vite-plugin-monaco-editor": "^1.1.0"
   }
 }

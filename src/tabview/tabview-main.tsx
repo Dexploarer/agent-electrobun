@@ -1,27 +1,49 @@
-import React from "react";
+import React, { Suspense, lazy } from "react";
 import ReactDOM from "react-dom/client";
 import { Electroview } from "electrobun/view";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { RouterProvider } from "@tanstack/react-router";
-import type { TabRPC } from "../stubs/types";
-import { router } from "./app/router";
+import type { TabRPC, TabKind } from "../stubs/types";
 import "./app/index.css";
 
-const tabId = new URLSearchParams(window.location.search).get("tabId") ?? "unknown";
+// Lazy-load slates to reduce initial bundle
+const WelcomeSlate = lazy(() => import("./app/slates/WelcomeSlate"));
+const CodeEditorSlate = lazy(() => import("./app/slates/CodeEditorSlate"));
+const TerminalSlate = lazy(() => import("./app/slates/TerminalSlate"));
+const WebSlate = lazy(() => import("./app/slates/WebSlate"));
+const GitSlate = lazy(() => import("./app/slates/GitSlate"));
+
+const params = new URLSearchParams(window.location.search);
+const tabId = params.get("tabId") ?? "unknown";
 const webviewId: number = (window as any).__electrobunWebviewId;
 
-// Tab RPC — connects this OOPIF to the Bun process
+// Extract tab metadata from hash (set by bun backend via URL params)
+const hashParams = new URLSearchParams(window.location.hash.slice(1));
+const tabKind: TabKind = (params.get("kind") as TabKind) ?? "welcome";
+const filePath = params.get("filePath") ?? undefined;
+const tabUrl = params.get("url") ?? undefined;
+const tabCwd = params.get("cwd") ?? undefined;
+const repoRoot = params.get("repoRoot") ?? undefined;
+
+// Tab RPC
 export const rpc = Electroview.defineRPC<TabRPC>({
   handlers: {
     requests: {},
-    messages: {},
+    messages: {
+      terminalOutput: (data) => {
+        window.dispatchEvent(new CustomEvent("terminalOutput", { detail: data }));
+      },
+      terminalExit: (data) => {
+        window.dispatchEvent(new CustomEvent("terminalExit", { detail: data }));
+      },
+      fileWatchEvent: (data) => {
+        window.dispatchEvent(new CustomEvent("fileWatchEvent", { detail: data }));
+      },
+    },
   },
 });
 
 new Electroview({ rpc });
 (window as any).__demoRpc = rpc;
 
-// Register with Bun so it can target this tab by tabId
 if (webviewId !== undefined) {
   rpc.request.registerTab({ tabId, webviewId });
   window.addEventListener("beforeunload", () => {
@@ -29,20 +51,34 @@ if (webviewId !== undefined) {
   });
 }
 
-const queryClient = new QueryClient({
-  defaultOptions: {
-    queries: {
-      retry: 1,
-      refetchOnWindowFocus: false,
-      staleTime: 10_000,
-    },
-  },
-});
+function SlateLoader() {
+  return (
+    <div className="flex items-center justify-center h-full text-neutral-500 text-sm">
+      Loading...
+    </div>
+  );
+}
+
+function TabContent() {
+  return (
+    <Suspense fallback={<SlateLoader />}>
+      {tabKind === "file" && filePath ? (
+        <CodeEditorSlate filePath={filePath} />
+      ) : tabKind === "terminal" ? (
+        <TerminalSlate cwd={tabCwd} />
+      ) : tabKind === "web" ? (
+        <WebSlate initialUrl={tabUrl} />
+      ) : tabKind === "git" ? (
+        <GitSlate repoRoot={repoRoot} />
+      ) : (
+        <WelcomeSlate />
+      )}
+    </Suspense>
+  );
+}
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
-    <QueryClientProvider client={queryClient}>
-      <RouterProvider router={router} />
-    </QueryClientProvider>
+    <TabContent />
   </React.StrictMode>
 );

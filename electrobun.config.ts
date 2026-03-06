@@ -2,9 +2,9 @@ import type { ElectrobunConfig } from "electrobun";
 
 export default {
   app: {
-    name: "ElectrobunDemo",
-    identifier: "com.ataraxy-labs.electrobun-demo",
-    version: "0.1.0",
+    name: "AgentWorkspace",
+    identifier: "com.ataraxy-labs.agent-workspace",
+    version: "0.2.0",
   },
   build: {
     bun: {
@@ -19,5 +19,8 @@ export default {
     mac: { bundleCEF: false },
     linux: { bundleCEF: false },
     win: { bundleCEF: false },
+  },
+  runtime: {
+    exitOnLastWindowClosed: false,
   },
 } satisfies ElectrobunConfig;

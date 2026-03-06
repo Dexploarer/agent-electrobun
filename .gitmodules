@@ -6,3 +6,7 @@
 	path = vendor/WebKit
 	url = https://github.com/blackboardsh/WebKit.git
 	shallow = true
+[submodule "vendor/colab"]
+	path = vendor/colab
+	url = https://github.com/blackboardsh/colab.git
+	shallow = true
